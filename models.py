@@ -114,6 +114,62 @@ class BatteryInfo:
 
 
 @dataclass
+class ProcessInfo:
+    """Сведения об одном запущенном процессе для вкладки «Диспетчер задач».
+
+    Это «лёгкая» строка таблицы, обновляемая каждую секунду для всех
+    процессов сразу. Более подробные и редко меняющиеся сведения об
+    одном конкретном процессе живут в ``ProcessDetails``.
+    """
+
+    pid: int
+    name: str = "Н/Д"
+    status: str = "Н/Д"
+    username: str = "Н/Д"
+    cpu_percent: float = 0.0
+    memory_mb: float = 0.0
+    memory_percent: float = 0.0
+    disk_read_kb_s: float = 0.0
+    disk_write_kb_s: float = 0.0
+    network_connections: int = 0
+    num_threads: int = 0
+    create_time: str = "Н/Д"
+
+
+@dataclass
+class ProcessDetails:
+    """Расширенные сведения об одном процессе для окна «Свойства процесса».
+
+    Собирается по требованию (при открытии окна свойств), а не каждую
+    секунду для всех процессов, так как часть этих данных (командная
+    строка, открытые файлы) дороже получать и почти никогда не меняется
+    в течение жизни процесса.
+    """
+
+    pid: int
+    ppid: int
+    parent_name: str = "Н/Д"
+    name: str = "Н/Д"
+    status: str = "Н/Д"
+    username: str = "Н/Д"
+    exe_path: str = "Н/Д"
+    cmdline: str = "Н/Д"
+    working_directory: str = "Н/Д"
+    create_time: str = "Н/Д"
+    priority: str = "Н/Д"
+    num_threads: int = 0
+    cpu_user_time_s: float = 0.0
+    cpu_system_time_s: float = 0.0
+    memory_rss_mb: float = 0.0
+    memory_vms_mb: float = 0.0
+    memory_percent: float = 0.0
+    disk_read_mb_total: float = 0.0
+    disk_write_mb_total: float = 0.0
+    open_files: int = 0
+    network_connections: int = 0
+
+
+@dataclass
 class SystemSnapshot:
     """Единый снимок всей системной информации на конкретный момент времени."""
 
@@ -125,4 +181,5 @@ class SystemSnapshot:
     gpus: List[GPUInfo]
     motherboard: MotherboardInfo
     battery: BatteryInfo
+    processes: List[ProcessInfo]
     timestamp: str

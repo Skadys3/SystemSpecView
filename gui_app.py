@@ -22,8 +22,8 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List, Optional, Tuple
 
-from my_project.my_pet_project.collectors import SystemInfoCollector
-from my_project.my_pet_project.models import SystemSnapshot
+from collectors import SystemInfoCollector
+from models import ProcessDetails, ProcessInfo, SystemSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,40 @@ APP_MIN_HEIGHT = 600
 LIVE_REFRESH_INTERVAL_MS = 1000
 QUEUE_POLL_INTERVAL_MS = 150
 CPU_SMOOTHING_FACTOR = 0.12
+
+# Столбцы вкладки «Диспетчер задач»: внутренний ключ -> (заголовок, ширина)
+PROCESS_COLUMNS: Tuple[Tuple[str, str, int], ...] = (
+    ("pid", "PID", 60),
+    ("name", "Имя процесса", 220),
+    ("user", "Пользователь", 120),
+    ("status", "Состояние", 110),
+    ("cpu", "ЦП, %", 70),
+    ("mem_mb", "Память, МБ", 100),
+    ("mem_pct", "Память, %", 80),
+    ("disk_read", "Диск чтение, КБ/с", 130),
+    ("disk_write", "Диск запись, КБ/с", 130),
+    ("net", "Сеть, подкл.", 90),
+    ("threads", "Потоки", 70),
+)
+
+# Ключи сортировки для каждого столбца диспетчера задач
+_PROCESS_SORT_KEYS = {
+    "pid": lambda p: p.pid,
+    "name": lambda p: p.name.lower(),
+    "user": lambda p: p.username.lower(),
+    "status": lambda p: p.status,
+    "cpu": lambda p: p.cpu_percent,
+    "mem_mb": lambda p: p.memory_mb,
+    "mem_pct": lambda p: p.memory_percent,
+    "disk_read": lambda p: p.disk_read_kb_s,
+    "disk_write": lambda p: p.disk_write_kb_s,
+    "net": lambda p: p.network_connections,
+    "threads": lambda p: p.num_threads,
+}
+
+# Столбцы, для которых при первом клике логично сортировать по убыванию
+# (наибольшая нагрузка — самый интересный процесс — должна быть сверху).
+_PROCESS_DESCENDING_BY_DEFAULT = {"cpu", "mem_mb", "mem_pct", "disk_read", "disk_write", "net", "threads"}
 
 
 class SystemInfoApp(tk.Tk):
@@ -53,6 +87,14 @@ class SystemInfoApp(tk.Tk):
         self._is_first_run = True
         self._cached_gpus = None
         self._cached_motherboard = None
+
+        # Состояние вкладки «Диспетчер задач»
+        self._process_filter_var = tk.StringVar()
+        self._process_sort_column = "cpu"
+        self._process_sort_reverse = True
+        self._process_row_data: Dict[str, ProcessInfo] = {}
+        self._process_tab_frame: Optional[ttk.Frame] = None
+        self._notebook: Optional[ttk.Notebook] = None
 
         self._build_style()
         self._build_menu()
@@ -111,6 +153,8 @@ class SystemInfoApp(tk.Tk):
 
         notebook = ttk.Notebook(self)
         notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
+        self._notebook = notebook
+        notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         self._tabs["overview"] = self._make_kv_tab(notebook, "Обзор")
         self._tabs["os"] = self._make_kv_tab(notebook, "Операционная система")
@@ -133,6 +177,7 @@ class SystemInfoApp(tk.Tk):
         )
         self._tabs["motherboard"] = self._make_kv_tab(notebook, "Материнская плата / BIOS")
         self._tabs["battery"] = self._make_kv_tab(notebook, "Батарея")
+        self._tabs["processes"] = self._make_process_tab(notebook)
 
         status_bar = ttk.Frame(self, padding=(8, 4))
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
@@ -169,15 +214,89 @@ class SystemInfoApp(tk.Tk):
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
+    def _make_process_tab(self, notebook: ttk.Notebook) -> ttk.Treeview:
+        """Создаёт вкладку «Диспетчер задач»: панель поиска/кнопок и таблицу процессов."""
+        frame = ttk.Frame(notebook, padding=8)
+        notebook.add(frame, text="Диспетчер задач")
+        self._process_tab_frame = frame
+
+        toolbar = ttk.Frame(frame)
+        toolbar.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
+
+        ttk.Label(toolbar, text="Поиск:").pack(side=tk.LEFT)
+        search_entry = ttk.Entry(toolbar, textvariable=self._process_filter_var, width=25)
+        search_entry.pack(side=tk.LEFT, padx=(4, 12))
+        self._process_filter_var.trace_add("write", lambda *_args: self._refresh_process_view())
+
+        ttk.Button(toolbar, text="Завершить процесс", command=self._terminate_selected_process).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="Свойства...", command=self._show_selected_process_properties).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+
+        self._process_count_label = ttk.Label(toolbar, text="", style="Status.TLabel")
+        self._process_count_label.pack(side=tk.RIGHT)
+
+        table_frame = ttk.Frame(frame)
+        table_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
+        columns = [key for key, _label, _width in PROCESS_COLUMNS]
+        tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
+        for key, label, width in PROCESS_COLUMNS:
+            tree.heading(key, text=label, command=lambda c=key: self._sort_process_view(c))
+            anchor = tk.W if key in ("name", "user", "status") else tk.E
+            tree.column(key, width=width, anchor=anchor)
+
+        v_scroll = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=tree.yview)
+        h_scroll = ttk.Scrollbar(frame, orient=tk.HORIZONTAL, command=tree.xview)
+        tree.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
+
+        tree.grid(row=0, column=0, sticky="nsew")
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+
+        tree.bind("<Double-1>", lambda _event: self._show_selected_process_properties())
+        tree.bind("<Button-3>", self._show_process_context_menu)
+
+        self._process_context_menu = tk.Menu(self, tearoff=False)
+        self._process_context_menu.add_command(label="Свойства...", command=self._show_selected_process_properties)
+        self._process_context_menu.add_separator()
+        self._process_context_menu.add_command(label="Завершить процесс", command=self._terminate_selected_process)
+        self._process_context_menu.add_command(
+            label="Завершить принудительно", command=lambda: self._terminate_selected_process(force=True)
+        )
+
+        return tree
+
+    def _on_tab_changed(self, _event: object = None) -> None:
+        """При переключении на вкладку «Диспетчер задач» сразу отрисовывает
+        самые свежие уже собранные данные (не дожидаясь следующего тика)."""
+        if self._is_process_tab_active() and self._latest_snapshot is not None:
+            self._populate_process_tab(self._latest_snapshot)
+
+    def _is_process_tab_active(self) -> bool:
+        if self._notebook is None or self._process_tab_frame is None:
+            return False
+        return self._notebook.select() == str(self._process_tab_frame)
+
     # ------------------------------------------------------------------ #
     # Обновление данных: фоновый поток + потокобезопасная очередь
     # ------------------------------------------------------------------ #
+    def _ensure_worker_running(self) -> None:
+        """Гарантирует, что бесконечный фоновый поток сбора данных запущен
+        РОВНО ОДИН раз за всё время жизни приложения.
+        """
+        if not getattr(self, "_worker_started", False):
+            self._worker_started = True
+            threading.Thread(target=self._collect_in_background, daemon=True).start()
+
     def _refresh_data(self) -> None:
         # Показываем надпись о сборе информации ТОЛЬКО при самом первом запуске
         if self._is_first_run:
             self._status_label.config(text="Сбор информации о системе...")
-            
-        threading.Thread(target=self._collect_in_background, daemon=True).start()
+
+        self._ensure_worker_running()
 
     def _collect_in_background(self) -> None:
         """Один бесконечный поток. Собирает данные раз в секунду без скачков в 0%."""
@@ -219,11 +338,7 @@ class SystemInfoApp(tk.Tk):
     def _poll_queue(self) -> None:
         """Просто забирает готовый snapshot и отдает его в ваш родной _populate_ui."""
         # Запускаем фоновый поток ТОЛЬКО ОДИН раз при старте приложения
-        if not getattr(self, "_worker_started", False):
-            self._worker_started = True
-            import threading
-            t = threading.Thread(target=self._collect_in_background, daemon=True)
-            t.start()
+        self._ensure_worker_running()
 
         # Выгребаем из очереди самый свежий секундный снимок железа
         snapshot = None
@@ -260,6 +375,12 @@ class SystemInfoApp(tk.Tk):
         self._populate_kv(self._tabs["motherboard"], self._motherboard_rows(snapshot))
         self._populate_kv(self._tabs["battery"], self._battery_rows(snapshot))
 
+        # Диспетчер задач содержит сотни строк — перестраиваем таблицу только
+        # когда пользователь на неё действительно смотрит, чтобы не тратить
+        # время главного потока на невидимую вкладку каждую секунду.
+        if self._is_process_tab_active():
+            self._populate_process_tab(snapshot)
+
     @staticmethod
     def _update_tree_rows(tree: ttk.Treeview, new_rows: List[Tuple]) -> None:
         """
@@ -294,6 +415,63 @@ class SystemInfoApp(tk.Tk):
     def _populate_table(self, tree: ttk.Treeview, rows: List[Tuple]) -> None:
         # Универсальный метод уже умеет работать с таблицами
         self._update_tree_rows(tree, rows)
+
+    def _populate_process_tab(self, s: SystemSnapshot) -> None:
+        """Фильтрует, сортирует и отображает список процессов.
+
+        ВАЖНО: значение PID кладём в таблицу как строку (``str(p.pid)``), а
+        не как ``int``. Универсальный метод ``_update_tree_rows`` определяет
+        "ту же самую" строку по совпадению первого столбца с тем, что уже
+        хранится в Treeview, а Tk всегда возвращает значения ячеек строками.
+        Если положить туда ``int``, сравнение никогда не совпадёт, и таблица
+        будет каждую секунду удалять и заново создавать вообще все строки —
+        а вместе с ними сбрасывать выделение пользователя.
+        """
+        processes = list(s.processes)
+
+        query = self._process_filter_var.get().strip().lower()
+        if query:
+            processes = [p for p in processes if query in p.name.lower() or query == str(p.pid)]
+
+        key_func = _PROCESS_SORT_KEYS.get(self._process_sort_column, _PROCESS_SORT_KEYS["cpu"])
+        processes.sort(key=key_func, reverse=self._process_sort_reverse)
+
+        self._process_row_data = {str(p.pid): p for p in processes}
+
+        rows = [
+            (
+                str(p.pid),
+                p.name,
+                p.username,
+                p.status,
+                p.cpu_percent,
+                p.memory_mb,
+                p.memory_percent,
+                p.disk_read_kb_s,
+                p.disk_write_kb_s,
+                p.network_connections,
+                p.num_threads,
+            )
+            for p in processes
+        ]
+        self._update_tree_rows(self._tabs["processes"], rows)
+        self._process_count_label.config(text=f"Процессов: {len(processes)}")
+
+    def _refresh_process_view(self) -> None:
+        """Перерисовывает вкладку «Диспетчер задач» из уже собранных данных
+        (используется при вводе текста в поле поиска — без нового опроса ОС)."""
+        if self._latest_snapshot is not None:
+            self._populate_process_tab(self._latest_snapshot)
+
+    def _sort_process_view(self, column: str) -> None:
+        """Обрабатывает клик по заголовку столбца: сортирует по нему, повторный
+        клик по тому же столбцу разворачивает порядок сортировки."""
+        if self._process_sort_column == column:
+            self._process_sort_reverse = not self._process_sort_reverse
+        else:
+            self._process_sort_column = column
+            self._process_sort_reverse = column in _PROCESS_DESCENDING_BY_DEFAULT
+        self._refresh_process_view()
 
     def _populate_overview(self, s: SystemSnapshot) -> None:
         rows = [
@@ -428,6 +606,147 @@ class SystemInfoApp(tk.Tk):
         ]
 
     # ------------------------------------------------------------------ #
+    # Диспетчер задач: выбор строки, завершение процесса, окно свойств
+    # ------------------------------------------------------------------ #
+    def _get_selected_pid(self) -> Optional[int]:
+        tree = self._tabs["processes"]
+        selection = tree.selection()
+        if not selection:
+            return None
+        values = tree.item(selection[0], "values")
+        if not values:
+            return None
+        try:
+            return int(values[0])
+        except (ValueError, IndexError):
+            return None
+
+    def _show_process_context_menu(self, event: tk.Event) -> None:
+        """Выделяет строку под курсором перед показом контекстного меню, чтобы
+        правый клик работал так же, как в стандартном Диспетчере задач Windows —
+        не требуя предварительного выделения левой кнопкой."""
+        tree = self._tabs["processes"]
+        row_id = tree.identify_row(event.y)
+        if not row_id:
+            return
+        tree.selection_set(row_id)
+        self._process_context_menu.tk_popup(event.x_root, event.y_root)
+
+    def _terminate_selected_process(self, force: bool = False) -> None:
+        pid = self._get_selected_pid()
+        if pid is None:
+            messagebox.showinfo(APP_TITLE, "Сначала выберите процесс в списке.")
+            return
+
+        proc_info = self._process_row_data.get(str(pid))
+        proc_name = proc_info.name if proc_info else str(pid)
+
+        action = "принудительно завершить" if force else "завершить"
+        confirmed = messagebox.askyesno(
+            APP_TITLE,
+            f"Вы действительно хотите {action} процесс «{proc_name}» (PID {pid})?\n\n"
+            "Все несохранённые данные в этом процессе будут потеряны.",
+            icon="warning",
+        )
+        if not confirmed:
+            return
+
+        # Завершение может занять до нескольких секунд (ожидание корректного
+        # закрытия перед принудительным убийством) — уводим в фоновый поток,
+        # чтобы интерфейс не "замирал".
+        def _do_terminate() -> None:
+            success, message = self._collector.terminate_process(pid, force=force)
+            self.after(0, lambda: self._on_terminate_done(success, message))
+
+        threading.Thread(target=_do_terminate, daemon=True).start()
+
+    def _on_terminate_done(self, success: bool, message: str) -> None:
+        if success:
+            messagebox.showinfo(APP_TITLE, message)
+        else:
+            messagebox.showerror(APP_TITLE, message)
+
+    def _show_selected_process_properties(self) -> None:
+        pid = self._get_selected_pid()
+        if pid is None:
+            messagebox.showinfo(APP_TITLE, "Сначала выберите процесс в списке.")
+            return
+
+        live_info = self._process_row_data.get(str(pid))
+
+        # Сбор подробных сведений делает несколько системных вызовов
+        # (командная строка, открытые файлы и т.д.) — на всякий случай тоже
+        # уводим в фоновый поток, чтобы не рисковать подвисанием интерфейса.
+        def _fetch() -> None:
+            details = self._collector.get_process_details(pid)
+            self.after(0, lambda: self._render_process_properties(pid, details, live_info))
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _render_process_properties(
+        self, pid: int, details: Optional[ProcessDetails], live_info: Optional[ProcessInfo]
+    ) -> None:
+        if details is None:
+            messagebox.showwarning(APP_TITLE, f"Процесс с PID {pid} уже завершён или недоступен.")
+            return
+
+        win = tk.Toplevel(self)
+        win.title(f"Свойства процесса — {details.name} (PID {pid})")
+        win.geometry("500x540")
+        win.transient(self)
+
+        tree = ttk.Treeview(win, columns=("property", "value"), show="headings")
+        tree.heading("property", text="Параметр")
+        tree.heading("value", text="Значение")
+        tree.column("property", width=200, anchor=tk.W)
+        tree.column("value", width=280, anchor=tk.W)
+        tree.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        rows: List[Tuple[str, str]] = [
+            ("PID", str(details.pid)),
+            ("Родительский процесс", f"{details.parent_name} (PID {details.ppid})"),
+            ("Имя", details.name),
+            ("Состояние", details.status),
+            ("Пользователь", details.username),
+            ("Путь к исполняемому файлу", details.exe_path),
+            ("Командная строка", details.cmdline),
+            ("Рабочий каталог", details.working_directory),
+            ("Запущен", details.create_time),
+            ("Приоритет", details.priority),
+            ("Потоков", str(details.num_threads)),
+            ("Открытых файлов", str(details.open_files)),
+            ("Сетевых подключений", str(details.network_connections)),
+            ("Время ЦП (пользователь)", f"{details.cpu_user_time_s} с"),
+            ("Время ЦП (система)", f"{details.cpu_system_time_s} с"),
+            ("Память RSS (рабочий набор)", f"{details.memory_rss_mb} МБ"),
+            ("Память VMS (виртуальная)", f"{details.memory_vms_mb} МБ"),
+            ("Использовано памяти", f"{details.memory_percent} %"),
+            ("Прочитано с диска (всего)", f"{details.disk_read_mb_total} МБ"),
+            ("Записано на диск (всего)", f"{details.disk_write_mb_total} МБ"),
+        ]
+        if live_info is not None:
+            rows.extend(
+                [
+                    ("— Текущая загрузка ЦП", f"{live_info.cpu_percent} %"),
+                    ("— Текущая память", f"{live_info.memory_mb} МБ"),
+                    ("— Диск: чтение сейчас", f"{live_info.disk_read_kb_s} КБ/с"),
+                    ("— Диск: запись сейчас", f"{live_info.disk_write_kb_s} КБ/с"),
+                ]
+            )
+
+        for row in rows:
+            tree.insert("", tk.END, values=row)
+
+        button_bar = ttk.Frame(win, padding=(8, 0, 8, 8))
+        button_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Button(
+            button_bar,
+            text="Завершить процесс",
+            command=lambda: (win.destroy(), self._terminate_selected_process()),
+        ).pack(side=tk.LEFT)
+        ttk.Button(button_bar, text="Закрыть", command=win.destroy).pack(side=tk.RIGHT)
+
+    # ------------------------------------------------------------------ #
     # Экспорт / О программе
     # ------------------------------------------------------------------ #
     def _export_report(self) -> None:
@@ -480,6 +799,13 @@ class SystemInfoApp(tk.Tk):
         for g in s.gpus:
             lines.append(f"{g.name} (драйвер {g.driver_version}, видеопамять Всего: {g.adapter_ram_gb} ГБ / Использовано: {g.used_ram_gb} ГБ)")
 
+        lines.append("\n[Топ-10 процессов по загрузке ЦП]")
+        top_processes = sorted(s.processes, key=lambda p: p.cpu_percent, reverse=True)[:10]
+        for p in top_processes:
+            lines.append(
+                f"PID {p.pid} — {p.name}: ЦП {p.cpu_percent}%, память {p.memory_mb} МБ ({p.memory_percent}%)"
+            )
+
         return "\n".join(lines)
 
     def _show_about(self) -> None:
@@ -487,6 +813,7 @@ class SystemInfoApp(tk.Tk):
             APP_TITLE,
             f"{APP_TITLE}\n\n"
             "Лёгкая утилита для просмотра подробной информации об "
-            "оборудовании и операционной системе.\n\n"
+            "оборудовании и операционной системе, включая встроенный "
+            "диспетчер задач (просмотр, завершение и свойства процессов).\n\n"
             "Создано с использованием Python, Tkinter, psutil и WMI.",
         )

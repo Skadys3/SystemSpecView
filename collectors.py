@@ -38,11 +38,12 @@ import datetime
 import logging
 import platform
 import socket
-from typing import List, Optional
+import time
+from typing import Dict, List, Optional, Tuple
 
 import psutil
 
-from my_project.my_pet_project.models import (
+from models import (
     BatteryInfo,
     CPUInfo,
     DiskPartitionInfo,
@@ -51,6 +52,8 @@ from my_project.my_pet_project.models import (
     MotherboardInfo,
     NetworkInterfaceInfo,
     OSInfo,
+    ProcessDetails,
+    ProcessInfo,
     SystemSnapshot,
 )
 
@@ -77,6 +80,50 @@ def _bytes_to_gb(value: int) -> float:
 def _bytes_to_mb(value: int) -> float:
     """Преобразует количество байт в мегабайты, округляя до 2 знаков после запятой."""
     return round(value / (1024**2), 2)
+
+
+def _build_process_status_translation() -> Dict[str, str]:
+    """Строит словарь перевода статусов процессов psutil на русский язык.
+
+    Используем ``getattr`` с запасным значением, поскольку не все константы
+    статусов существуют на всех платформах и во всех версиях psutil.
+    """
+    definitions = [
+        ("STATUS_RUNNING", "Выполняется"),
+        ("STATUS_SLEEPING", "Ожидание"),
+        ("STATUS_DISK_SLEEP", "Ожидание диска"),
+        ("STATUS_STOPPED", "Остановлен"),
+        ("STATUS_TRACING_STOP", "Отладка"),
+        ("STATUS_ZOMBIE", "Зомби"),
+        ("STATUS_DEAD", "Завершён"),
+        ("STATUS_WAKE_KILL", "Завершение"),
+        ("STATUS_WAKING", "Пробуждение"),
+        ("STATUS_IDLE", "Простой"),
+        ("STATUS_LOCKED", "Заблокирован"),
+        ("STATUS_WAITING", "Ожидание"),
+        ("STATUS_SUSPENDED", "Приостановлен"),
+        ("STATUS_PARKED", "Парковка"),
+    ]
+    translation: Dict[str, str] = {}
+    for attr_name, russian_label in definitions:
+        value = getattr(psutil, attr_name, None)
+        if value is not None:
+            translation[value] = russian_label
+    return translation
+
+
+_PROCESS_STATUS_RU = _build_process_status_translation()
+
+# Приоритеты процессов Windows (Win32 priority classes). На других ОС psutil
+# возвращает обычное значение "niceness", которое просто отображается как есть.
+_WINDOWS_PRIORITY_RU = {
+    "IDLE_PRIORITY_CLASS": "Низкий (фоновый)",
+    "BELOW_NORMAL_PRIORITY_CLASS": "Ниже среднего",
+    "NORMAL_PRIORITY_CLASS": "Обычный",
+    "ABOVE_NORMAL_PRIORITY_CLASS": "Выше среднего",
+    "HIGH_PRIORITY_CLASS": "Высокий",
+    "REALTIME_PRIORITY_CLASS": "Реального времени",
+}
 
 
 class SystemInfoCollector:
@@ -374,6 +421,290 @@ class SystemInfoCollector:
             logger.error("Ошибка при сборе информации о батарее: %s", exc)
             return BatteryInfo(present=False)
 
+    # ------------------------------------------------------------------ #
+    # Диспетчер задач: список процессов, свойства, завершение
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _safe(func, default):
+        """Вызывает ``func()`` и возвращает ``default``, если это не удалось.
+
+        Многие методы ``psutil.Process`` могут в любой момент выбросить
+        ``AccessDenied`` (нет прав, обычно для системных процессов) или
+        ``NoSuchProcess`` (процесс успел завершиться между вызовами) —
+        такие поля просто мягко деградируют в "Н/Д", как и весь остальной
+        сборщик данных в этом классе.
+        """
+        try:
+            return func()
+        except Exception:
+            return default
+
+    def _init_process_maps(self) -> None:
+        """Лениво создаёт кэши, нужные для расчёта загрузки ЦП и скорости
+        дискового ввода-вывода по процессам как разницы между двумя опросами
+        (тот же приём, что уже используется для общей загрузки ЦП)."""
+        if not hasattr(self, "_process_cache"):
+            self._process_cache: Dict[int, "psutil.Process"] = {}
+        if not hasattr(self, "_process_io_cache"):
+            self._process_io_cache: Dict[int, Tuple[int, int]] = {}
+        if not hasattr(self, "_process_last_poll_time"):
+            self._process_last_poll_time: Optional[float] = None
+
+    @staticmethod
+    def _get_connection_counts_by_pid() -> Dict[int, int]:
+        """Возвращает словарь {pid: число активных сетевых подключений}.
+
+        Получен ОДНИМ системным запросом сразу для всех процессов — это
+        значительно быстрее, чем опрашивать каждый процесс по отдельности.
+        Важное ограничение: psutil не предоставляет кроссплатформенный способ
+        узнать скорость сетевого трафика (байт/с) в разрезе процесса ни на
+        одной ОС, поэтому число подключений — лучшее доступное приближение
+        к "сетевой нагрузке" процесса, а не показатель пропускной способности.
+        """
+        counts: Dict[int, int] = {}
+        try:
+            connections = psutil.net_connections(kind="inet")
+        except Exception as exc:
+            logger.debug("Не удалось получить список сетевых подключений: %s", exc)
+            return counts
+        for conn in connections:
+            if conn.pid:
+                counts[conn.pid] = counts.get(conn.pid, 0) + 1
+        return counts
+
+    def get_process_list(self) -> List[ProcessInfo]:
+        """Собирает построчный список всех запущенных процессов для вкладки
+        «Диспетчер задач»: загрузка ЦП, память, скорость диска и сетевая
+        активность.
+
+        Переиспользует объекты ``psutil.Process`` между вызовами (кэш по
+        PID), потому что и загрузка ЦП, и скорость дискового ввода-вывода
+        считаются как разница между двумя последовательными замерами —
+        точно так же, как уже сделано для общей загрузки ЦП в
+        ``get_cpu_info``.
+        """
+        self._init_process_maps()
+
+        now = time.monotonic()
+        elapsed = (now - self._process_last_poll_time) if self._process_last_poll_time else None
+        self._process_last_poll_time = now
+
+        connection_counts = self._get_connection_counts_by_pid()
+        logical_cores = psutil.cpu_count(logical=True) or 1
+
+        result: List[ProcessInfo] = []
+        live_pids = set()
+
+        for pid in psutil.pids():
+            live_pids.add(pid)
+            proc = self._process_cache.get(pid)
+            is_new = proc is None
+            if is_new:
+                try:
+                    proc = psutil.Process(pid)
+                    proc.cpu_percent(None)  # запускаем отсчёт с нуля, без блокировки
+                    self._process_cache[pid] = proc
+                except Exception:
+                    # Процесс исчез между psutil.pids() и созданием объекта,
+                    # либо недостаточно прав (например, "System Idle Process").
+                    continue
+
+            try:
+                with proc.oneshot():
+                    name = proc.name() or "Н/Д"
+                    raw_status = proc.status()
+                    username = self._safe(proc.username, "Н/Д")
+                    num_threads = proc.num_threads()
+                    mem_info = proc.memory_info()
+                    mem_pct = proc.memory_percent()
+                    cpu_raw = 0.0 if is_new else proc.cpu_percent(None)
+                    create_ts = self._safe(proc.create_time, None)
+
+                # Нормализуем загрузку ЦП к шкале 0-100% для системы в целом
+                # (как в современном Диспетчере задач Windows), а не к шкале
+                # "0-100% на одно ядро", которую по умолчанию отдаёт psutil.
+                cpu_pct = round(cpu_raw / logical_cores, 1)
+                mem_mb = _bytes_to_mb(mem_info.rss)
+                create_str = (
+                    datetime.datetime.fromtimestamp(create_ts).strftime("%Y-%m-%d %H:%M:%S")
+                    if create_ts
+                    else "Н/Д"
+                )
+
+                read_kb_s, write_kb_s = 0.0, 0.0
+                try:
+                    io = proc.io_counters()
+                    prev_io = self._process_io_cache.get(pid)
+                    self._process_io_cache[pid] = (io.read_bytes, io.write_bytes)
+                    if prev_io is not None and elapsed and elapsed > 0:
+                        read_kb_s = round(max(0, io.read_bytes - prev_io[0]) / 1024 / elapsed, 1)
+                        write_kb_s = round(max(0, io.write_bytes - prev_io[1]) / 1024 / elapsed, 1)
+                except Exception:
+                    pass  # io_counters недоступен (нет прав или не Windows/Linux)
+
+                result.append(
+                    ProcessInfo(
+                        pid=pid,
+                        name=name,
+                        status=_PROCESS_STATUS_RU.get(raw_status, raw_status),
+                        username=username,
+                        cpu_percent=cpu_pct,
+                        memory_mb=mem_mb,
+                        memory_percent=round(mem_pct, 1),
+                        disk_read_kb_s=read_kb_s,
+                        disk_write_kb_s=write_kb_s,
+                        network_connections=connection_counts.get(pid, 0),
+                        num_threads=num_threads,
+                        create_time=create_str,
+                    )
+                )
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                self._process_cache.pop(pid, None)
+                self._process_io_cache.pop(pid, None)
+                continue
+            except Exception as exc:
+                logger.debug("Пропуск процесса PID %s при сборе списка: %s", pid, exc)
+                continue
+
+        # Убираем из кэша процессы, которые уже завершились, чтобы не
+        # накапливать "мёртвые" объекты Process в памяти.
+        for old_pid in list(self._process_cache.keys()):
+            if old_pid not in live_pids:
+                del self._process_cache[old_pid]
+                self._process_io_cache.pop(old_pid, None)
+
+        return result
+
+    def _priority_to_str(self, nice_value) -> str:
+        """Переводит числовое значение приоритета в понятную русскую подпись."""
+        if nice_value is None:
+            return "Н/Д"
+        if platform.system() == "Windows":
+            for attr_name, russian_label in _WINDOWS_PRIORITY_RU.items():
+                if nice_value == getattr(psutil, attr_name, object()):
+                    return russian_label
+        return str(nice_value)
+
+    def get_process_details(self, pid: int) -> Optional[ProcessDetails]:
+        """Собирает расширенные сведения об одном процессе для окна «Свойства».
+
+        В отличие от ``get_process_list``, вызывается по требованию — только
+        когда пользователь открывает окно свойств конкретного процесса,
+        поэтому не обязан быть таким же дешёвым, как построчный список.
+        Возвращает ``None``, если процесс уже завершился.
+        """
+        try:
+            proc = psutil.Process(pid)
+            with proc.oneshot():
+                name = proc.name() or "Н/Д"
+                status = _PROCESS_STATUS_RU.get(proc.status(), proc.status())
+                username = self._safe(proc.username, "Н/Д")
+                exe_path = self._safe(proc.exe, "Н/Д") or "Н/Д"
+                cmdline_list = self._safe(proc.cmdline, [])
+                cmdline = " ".join(cmdline_list) if cmdline_list else "Н/Д"
+                cwd = self._safe(proc.cwd, "Н/Д") or "Н/Д"
+                create_ts = proc.create_time()
+                priority = self._priority_to_str(self._safe(proc.nice, None))
+                num_threads = proc.num_threads()
+                cpu_times = proc.cpu_times()
+                mem_info = proc.memory_info()
+                mem_pct = round(proc.memory_percent(), 1)
+                ppid = self._safe(proc.ppid, 0) or 0
+                open_files = len(self._safe(proc.open_files, []))
+
+            create_str = datetime.datetime.fromtimestamp(create_ts).strftime("%Y-%m-%d %H:%M:%S")
+
+            parent_name = "Н/Д"
+            if ppid:
+                try:
+                    parent_name = psutil.Process(ppid).name()
+                except Exception:
+                    pass
+
+            read_total_mb = write_total_mb = 0.0
+            try:
+                io = proc.io_counters()
+                read_total_mb = _bytes_to_mb(io.read_bytes)
+                write_total_mb = _bytes_to_mb(io.write_bytes)
+            except Exception:
+                pass
+
+            connection_count = self._get_connection_counts_by_pid().get(pid, 0)
+
+            return ProcessDetails(
+                pid=pid,
+                ppid=ppid,
+                parent_name=parent_name,
+                name=name,
+                status=status,
+                username=username,
+                exe_path=exe_path,
+                cmdline=cmdline,
+                working_directory=cwd,
+                create_time=create_str,
+                priority=priority,
+                num_threads=num_threads,
+                cpu_user_time_s=round(cpu_times.user, 1),
+                cpu_system_time_s=round(cpu_times.system, 1),
+                memory_rss_mb=_bytes_to_mb(mem_info.rss),
+                memory_vms_mb=_bytes_to_mb(mem_info.vms),
+                memory_percent=mem_pct,
+                disk_read_mb_total=read_total_mb,
+                disk_write_mb_total=write_total_mb,
+                open_files=open_files,
+                network_connections=connection_count,
+            )
+        except psutil.NoSuchProcess:
+            return None
+        except Exception as exc:
+            logger.error("Ошибка при сборе подробных сведений о процессе PID %s: %s", pid, exc)
+            return None
+
+    def terminate_process(self, pid: int, force: bool = False) -> Tuple[bool, str]:
+        """Завершает процесс по PID.
+
+        Без ``force`` сначала пытается закрыть процесс корректно
+        (``terminate()`` — на Windows это ``TerminateProcess`` после попытки
+        мягкого завершения через сообщения, у psutil — эквивалент SIGTERM),
+        и только если он не завершился за отведённое время, "убивает" его
+        принудительно. С ``force=True`` сразу переходит к принудительному
+        завершению. Может вызываться из фонового потока: ``wait()`` внутри
+        может занять до нескольких секунд, поэтому вызывающий код (GUI) не
+        должен делать это в главном потоке интерфейса.
+
+        Возвращает кортеж (успех, сообщение_для_пользователя_на_русском).
+        """
+        try:
+            proc = psutil.Process(pid)
+            name = proc.name()
+        except psutil.NoSuchProcess:
+            return False, f"Процесс с PID {pid} уже не существует."
+        except psutil.AccessDenied:
+            return False, f"Недостаточно прав для доступа к процессу с PID {pid}."
+
+        try:
+            if force:
+                proc.kill()
+            else:
+                proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except psutil.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=3)
+            return True, f"Процесс «{name}» (PID {pid}) успешно завершён."
+        except psutil.NoSuchProcess:
+            # Процесс успел завершиться сам, пока мы ждали — это тоже успех.
+            return True, f"Процесс «{name}» (PID {pid}) успешно завершён."
+        except psutil.AccessDenied:
+            return False, (
+                f"Недостаточно прав для завершения процесса «{name}» (PID {pid}). "
+                "Попробуйте запустить приложение от имени администратора."
+            )
+        except Exception as exc:
+            logger.error("Ошибка при завершении процесса PID %s: %s", pid, exc)
+            return False, f"Не удалось завершить процесс «{name}» (PID {pid}): {exc}"
+
     def collect_all(self, is_first_run: bool = False) -> SystemSnapshot:
         """Собирает все категории информации в единый снимок."""
         logger.info("Сбор полного снимка состояния системы...")
@@ -391,6 +722,7 @@ class SystemInfoCollector:
             gpus=self.get_gpu_info(is_first_run=is_first_run), 
             motherboard=self._cached_motherboard_info or self.get_motherboard_info(),
             battery=self.get_battery_info(),      # Всегда собирается заново
+            processes=self.get_process_list(),    # Для вкладки «Диспетчер задач»
             timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
         logger.info("Сбор снимка системы завершён.")

@@ -87,7 +87,7 @@ def main() -> None:
     # Импортируется после настройки логирования, чтобы предупреждения,
     # возникающие при импорте (например, отсутствие пакета 'wmi'),
     # тоже попадали в лог-файл.
-    from my_project.my_pet_project.gui_app import SystemInfoApp
+    from gui_app import SystemInfoApp
 
     logger.info("Запуск приложения «Просмотр характеристик компьютера»...")
     app = SystemInfoApp()
