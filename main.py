@@ -14,15 +14,7 @@ main.py
 import logging
 import platform
 import sys
-import os
 from pathlib import Path
-
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.abspath(os.path.join(current_dir, "..", ".."))
-
-# Принудительно добавляем её в пути поиска Python
-if parent_dir not in sys.path:
-    sys.path.insert(0, parent_dir)
 
 # Проверяем, запущена ли программа как скомпилированный .exe
 if getattr(sys, 'frozen', False):
@@ -30,13 +22,13 @@ if getattr(sys, 'frozen', False):
     EXE_DIR = Path(sys.executable).parent
     LOG_DIR = EXE_DIR / "logs"
 else:
-    # Обычный запуск .py скрипта в редакторе кода
+    # Обычный запуск .py скрипта: main.py, models.py, collectors.py,
+    # gui_app.py и т.д. лежат рядом, в одной папке. Python сам добавляет
+    # папку запускаемого скрипта в sys.path, так что дополнительных
+    # манипуляций с путями для импорта соседних модулей не требуется.
     LOG_DIR = Path(__file__).resolve().parent / "logs"
-    # Этот путь нужен только для разработки, чтобы Python видел пакеты
-    sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 LOG_FILE = LOG_DIR / "system_specs_viewer.log"
-sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 
 def _configure_logging() -> None:

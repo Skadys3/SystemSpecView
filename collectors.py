@@ -705,25 +705,47 @@ class SystemInfoCollector:
             logger.error("Ошибка при завершении процесса PID %s: %s", pid, exc)
             return False, f"Не удалось завершить процесс «{name}» (PID {pid}): {exc}"
 
-    def collect_all(self, is_first_run: bool = False) -> SystemSnapshot:
-        """Собирает все категории информации в единый снимок."""
-        logger.info("Сбор полного снимка состояния системы...")
-        
-        # Тяжелые статические данные о материнской плате собираем только ОДИН раз при старте
-        if not hasattr(self, "_cached_motherboard_info"):
-            self._cached_motherboard_info = self._get_wmi_client() and self.get_motherboard_info()
-            
+    def collect_all(self, is_first_run: bool = False, collect_processes: bool = True) -> SystemSnapshot:
+        """Собирает все категории информации в единый снимок.
+
+        ``collect_processes=False`` пропускает дорогой обход списка всех
+        процессов системы (перечисление PID, запросы psutil по памяти,
+        дисковому I/O и сетевым подключениям на КАЖДЫЙ процесс) и
+        переиспользует последний собранный список. Используется, когда
+        вкладка «Диспетчер задач» сейчас не видна пользователю — эти данные
+        всё равно никто не смотрит, а их сбор на системе с несколькими
+        сотнями процессов — самая дорогая операция во всём цикле опроса.
+        """
+        logger.debug("Сбор полного снимка состояния системы...")
+
+        # Тяжёлые статические данные о материнской плате собираем только
+        # ОДИН раз при старте. Раньше кэш определялся через истинность
+        # выражения "_get_wmi_client() and get_motherboard_info()" — если
+        # первая попытка получить клиент WMI случайно проваливалась,
+        # результат (None) навсегда оставался "ложным", и WMI-запрос
+        # повторялся заново на каждом цикле опроса. Явный флаг это исключает.
+        if not hasattr(self, "_motherboard_collected"):
+            self._cached_motherboard_info = (
+                self.get_motherboard_info() if self._get_wmi_client() else MotherboardInfo()
+            )
+            self._motherboard_collected = True
+
+        if collect_processes:
+            self._last_process_list = self.get_process_list()
+        elif not hasattr(self, "_last_process_list"):
+            self._last_process_list = []
+
         snapshot = SystemSnapshot(
             os_info=self.get_os_info(),
             cpu_info=self.get_cpu_info(is_first_run=is_first_run),
             memory_info=self.get_memory_info(),  # Всегда собирается заново
             disks=self.get_disk_info(),          # Всегда собирается заново
             network_interfaces=self.get_network_info(), # Всегда собирается заново
-            gpus=self.get_gpu_info(is_first_run=is_first_run), 
-            motherboard=self._cached_motherboard_info or self.get_motherboard_info(),
+            gpus=self.get_gpu_info(is_first_run=is_first_run),
+            motherboard=self._cached_motherboard_info,
             battery=self.get_battery_info(),      # Всегда собирается заново
-            processes=self.get_process_list(),    # Для вкладки «Диспетчер задач»
+            processes=self._last_process_list,    # Для вкладки «Диспетчер задач»
             timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
-        logger.info("Сбор снимка системы завершён.")
+        logger.debug("Сбор снимка системы завершён.")
         return snapshot

@@ -1,16 +1,23 @@
-# Кроссплатформенные системные метрики (CPU, память, диски, сеть, батарея)
+# Cross-platform system metrics (CPU, memory, disks, network, battery)
 psutil>=5.9.0
 
-# Привязки к Windows Management Instrumentation — используются для получения
-# сведений о материнской плате, BIOS и видеокарте. Устанавливаются только на
-# Windows; приложение корректно деградирует (поля показывают "Н/Д"), если
-# этих пакетов нет в другой ОС.
+# Modern UI on top of Tkinter (cards, dark/light theme, rounded widgets)
+customtkinter>=5.2.0
+
+# Sidebar icons and mini-charts in icons.py/widgets.py.
+# Listed explicitly: customtkinter does NOT pull in Pillow itself
+# (only darkdetect, packaging, typing-extensions), and our code
+# imports PIL directly.
+Pillow>=10.0.0
+
+# Windows Management Instrumentation bindings - used for motherboard,
+# BIOS, and GPU details. Windows-only; the app degrades gracefully
+# (fields show "N/A") if these packages are missing on another OS.
 wmi>=1.5.1; platform_system == "Windows"
 pywin32>=306; platform_system == "Windows"
 
-# NVIDIA Management Library — используется для получения актуальных данных
-# об использовании видеопамяти GPU в реальном времени (обходит ограничение
-# WMI на переполнение 32-битного поля AdapterRAM). Работает только с
-# видеокартами NVIDIA; на других GPU приложение просто не получит "живые"
-# данные об использованной видеопамяти.
+# NVIDIA Management Library - used to get accurate real-time GPU VRAM
+# usage (works around WMI's 32-bit signed AdapterRAM overflow bug).
+# NVIDIA GPUs only; on other GPUs the app simply won't get "live" VRAM
+# usage data.
 pynvml>=11.5.0; platform_system == "Windows"
