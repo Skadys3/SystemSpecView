@@ -5,12 +5,14 @@ widgets.py
 (спарклайны), кольцевые индикаторы загрузки, сетки "параметр/значение",
 боковая панель навигации.
 
-Спарклайны и кольцевые индикаторы рисуются на обычном ``tkinter.Canvas``,
-потому что CustomTkinter не даёт прямого доступа к произвольной отрисовке.
-Canvas не умеет сам подстраивать цвет фона под смену темы оформления, поэтому
-каждый такой виджет регистрирует себя в модульном реестре и по вызову
-:func:`refresh_all_canvas_themes` (после переключения темы) перекрашивается
-вручную.
+ОПТИМИЗАЦИИ:
+- Sparkline: dirty-checking по хешу значений — не перерисовывает Canvas,
+  если данные не изменились.
+- RingGauge: dirty-checking по проценту + тексту + цвету — не перерисовывает,
+  если ничего не поменялось.
+- ProgressStatCard: dirty-checking по value_text + percent + subtitle.
+- HeroStatCard: dirty-checking через дочерние виджеты (RingGauge и Sparkline
+  сами решают, надо ли перерисовываться).
 """
 
 from tkinter import ttk
@@ -23,9 +25,7 @@ import icons
 import theme
 
 # ------------------------------------------------------------------ #
-# Реестр "сырых" Canvas-виджетов, которым нужно вручную сообщать о смене
-# темы оформления (обычные CTk-виджеты с fg_color=(light, dark) делают
-# это сами).
+# Реестр Canvas-виджетов для ручной смены темы
 # ------------------------------------------------------------------ #
 _canvas_registry: List["_ThemedCanvas"] = []
 
@@ -52,26 +52,35 @@ class _ThemedCanvas(tk.Canvas):
         self.configure(bg=theme.resolve(self._bg_key))
         self._redraw()
 
-    def _redraw(self) -> None:  # переопределяется в наследниках
+    def _redraw(self) -> None:
         pass
 
 
 # ------------------------------------------------------------------ #
-# Спарклайн — мини-график истории значений.
+# Спарклайн с dirty-checking
 # ------------------------------------------------------------------ #
 class Sparkline(_ThemedCanvas):
+    __slots__ = ("_color_key", "_values", "_vmin", "_vmax", "_last_hash", "_last_ck")
+
     def __init__(self, master, bg_key: str = "card_bg", color_key: str = "accent", height: int = 44, **kwargs):
         super().__init__(master, bg_key=bg_key, height=height, **kwargs)
         self._color_key = color_key
         self._values: Sequence[float] = []
         self._vmin = 0.0
         self._vmax = 100.0
+        self._last_hash = -1
+        self._last_ck = ""
         self.bind("<Configure>", lambda _e: self._redraw())
 
     def set_color_key(self, color_key: str) -> None:
         self._color_key = color_key
 
     def update_values(self, values: Sequence[float], vmin: float = 0.0, vmax: Optional[float] = None) -> None:
+        new_hash = hash((tuple(values), vmin, vmax))
+        if new_hash == self._last_hash and self._last_ck == self._color_key:
+            return
+        self._last_hash = new_hash
+        self._last_ck = self._color_key
         self._values = list(values)
         self._vmin = vmin
         self._vmax = vmax if vmax is not None else (max(self._values) if self._values else 100.0)
@@ -105,9 +114,12 @@ class Sparkline(_ThemedCanvas):
 
 
 # ------------------------------------------------------------------ #
-# Кольцевой индикатор процента (для ключевых метрик ЦП/памяти).
+# Кольцевой индикатор с dirty-checking
 # ------------------------------------------------------------------ #
 class RingGauge(_ThemedCanvas):
+    __slots__ = ("_size", "_thickness", "_percent", "_center_text", "_color_key",
+                 "_last_pct", "_last_ck", "_last_ct")
+
     def __init__(self, master, bg_key: str = "card_bg", size: int = 96, thickness: int = 10, **kwargs):
         super().__init__(master, bg_key=bg_key, width=size, height=size, **kwargs)
         self._size = size
@@ -115,12 +127,24 @@ class RingGauge(_ThemedCanvas):
         self._percent = 0.0
         self._center_text = "—"
         self._color_key = "accent"
+        self._last_pct = -1.0
+        self._last_ck = ""
+        self._last_ct = ""
 
     def update_value(self, percent: float, center_text: Optional[str] = None, color_key: Optional[str] = None) -> None:
-        self._percent = max(0.0, min(100.0, percent))
-        self._center_text = center_text if center_text is not None else f"{percent:.0f}%"
-        if color_key:
-            self._color_key = color_key
+        new_pct = max(0.0, min(100.0, percent))
+        new_ct = center_text if center_text is not None else f"{percent:.0f}%"
+        new_ck = color_key or self._color_key
+        if (abs(new_pct - self._last_pct) < 0.1 and
+            new_ct == self._last_ct and
+            new_ck == self._last_ck):
+            return
+        self._last_pct = new_pct
+        self._last_ct = new_ct
+        self._last_ck = new_ck
+        self._percent = new_pct
+        self._center_text = new_ct
+        self._color_key = new_ck
         self._redraw()
 
     def _redraw(self) -> None:
@@ -150,7 +174,7 @@ class RingGauge(_ThemedCanvas):
 
 
 # ------------------------------------------------------------------ #
-# Базовая карточка.
+# Базовая карточка
 # ------------------------------------------------------------------ #
 class Card(ctk.CTkFrame):
     def __init__(self, master, **kwargs):
@@ -173,8 +197,7 @@ def _card_header(parent, title: str, icon_name: Optional[str], row: int = 0, pad
 
 
 # ------------------------------------------------------------------ #
-# Крупная карточка-метрика с кольцевым индикатором и спарклайном истории
-# (используется на дашборде для ЦП и памяти).
+# Крупная карточка-метрика (dirty-checking через дочерние виджеты)
 # ------------------------------------------------------------------ #
 class HeroStatCard(Card):
     def __init__(self, master, title: str, icon_name: Optional[str] = None, **kwargs):
@@ -205,6 +228,9 @@ class HeroStatCard(Card):
         self._spark = Sparkline(self, bg_key="card_bg", color_key="accent", height=46)
         self._spark.grid(row=2, column=0, sticky="ew", padx=14, pady=(12, 14))
 
+        self._last_detail = ""
+        self._last_sub = ""
+
     def update(
         self,
         percent: float,
@@ -215,16 +241,23 @@ class HeroStatCard(Card):
     ) -> None:
         level_key = theme.level_color(percent)
         self._ring.update_value(percent, color_key=level_key)
-        self._detail_label.configure(text=detail)
-        self._sub_label.configure(text=subtitle)
+        if detail != self._last_detail:
+            self._last_detail = detail
+            self._detail_label.configure(text=detail)
+        if subtitle != self._last_sub:
+            self._last_sub = subtitle
+            self._sub_label.configure(text=subtitle)
         self._spark.set_color_key(level_key)
         self._spark.update_values(history, vmin=0, vmax=history_max)
 
 
 # ------------------------------------------------------------------ #
-# Карточка с прогресс-баром (диски, батарея, подкачка, ядра ЦП...).
+# Карточка с прогресс-баром и dirty-checking
 # ------------------------------------------------------------------ #
 class ProgressStatCard(Card):
+    __slots__ = ("_value_label", "_percent_label", "_bar", "_sub_label",
+                 "_last_vt", "_last_pct", "_last_sub")
+
     def __init__(self, master, title: str, icon_name: Optional[str] = None, **kwargs):
         super().__init__(master, **kwargs)
         self.grid_columnconfigure(0, weight=1)
@@ -256,7 +289,18 @@ class ProgressStatCard(Card):
         )
         self._sub_label.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 14))
 
+        self._last_vt = ""
+        self._last_pct = -999.0
+        self._last_sub = ""
+
     def update(self, value_text: str, percent: float, subtitle: str = "", muted: bool = False) -> None:
+        pct_rounded = round(percent, 1)
+        if value_text == self._last_vt and pct_rounded == self._last_pct and subtitle == self._last_sub:
+            return
+        self._last_vt = value_text
+        self._last_pct = pct_rounded
+        self._last_sub = subtitle
+
         self._value_label.configure(text=value_text)
         self._percent_label.configure(text="" if muted else f"{percent:.0f}%")
         self._bar.set(0.0 if muted else max(0.0, min(1.0, percent / 100.0)))
@@ -265,9 +309,11 @@ class ProgressStatCard(Card):
 
 
 # ------------------------------------------------------------------ #
-# Простая карточка "значение без графика" (для компактных фактов).
+# Простая карточка "значение без графика"
 # ------------------------------------------------------------------ #
 class FactCard(Card):
+    __slots__ = ("_value_label", "_sub_label", "_last_vt", "_last_sub")
+
     def __init__(self, master, title: str, icon_name: Optional[str] = None, **kwargs):
         super().__init__(master, **kwargs)
         self.grid_columnconfigure(0, weight=1)
@@ -282,15 +328,20 @@ class FactCard(Card):
             anchor="w", justify="left", wraplength=220,
         )
         self._sub_label.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 14))
+        self._last_vt = ""
+        self._last_sub = ""
 
     def update(self, value_text: str, subtitle: str = "") -> None:
+        if value_text == self._last_vt and subtitle == self._last_sub:
+            return
+        self._last_vt = value_text
+        self._last_sub = subtitle
         self._value_label.configure(text=value_text)
         self._sub_label.configure(text=subtitle)
 
 
 # ------------------------------------------------------------------ #
-# Сетка "параметр -> значение" в виде карточки (заменяет плоские
-# key/value-вкладки старого интерфейса).
+# Сетка "параметр -> значение"
 # ------------------------------------------------------------------ #
 class InfoGrid(Card):
     def __init__(self, master, title: Optional[str] = None, icon_name: Optional[str] = None, columns: int = 1, **kwargs):
@@ -339,7 +390,7 @@ class InfoGrid(Card):
 
 
 # ------------------------------------------------------------------ #
-# Заголовок страницы: название + подзаголовок + область для кнопок.
+# Заголовок страницы
 # ------------------------------------------------------------------ #
 class PageHeader(ctk.CTkFrame):
     def __init__(self, master, title: str, subtitle: str = "", **kwargs):
@@ -361,11 +412,10 @@ class PageHeader(ctk.CTkFrame):
 
 
 # ------------------------------------------------------------------ #
-# Боковая панель навигации.
+# Боковая панель навигации
 # ------------------------------------------------------------------ #
 class Sidebar(ctk.CTkFrame):
     def __init__(self, master, items: Sequence[Tuple[str, str, str]], on_select: Callable[[str], None], **kwargs):
-        """``items`` — список (key, label, icon_name)."""
         kwargs.setdefault("fg_color", theme.color("sidebar_bg"))
         kwargs.setdefault("corner_radius", 0)
         kwargs.setdefault("width", theme.SIDEBAR_WIDTH)
@@ -436,13 +486,12 @@ class Sidebar(ctk.CTkFrame):
     def register_icon(self, key: str, icon_name: str) -> None:
         self._icon_map[key] = icon_name
 
-    def _icon_of(self, key: str) -> str:
-        return self._icon_map.get(key, "dashboard")
+    def _icon_of(self, key: Optional[str]) -> str:
+        return self._icon_map.get(key, "dashboard") if key else "dashboard"
 
 
 # ------------------------------------------------------------------ #
-# ttk.Treeview (диспетчер задач) не подстраивается под тему сам —
-# перекрашиваем вручную при старте и при переключении темы.
+# Стилизация Treeview
 # ------------------------------------------------------------------ #
 def style_treeview(style: ttk.Style) -> None:
     bg = theme.resolve("card_bg")

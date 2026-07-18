@@ -41,6 +41,7 @@ HISTORY_LENGTH = 60
 
 # Столбцы вкладки «Диспетчер задач»: внутренний ключ -> (заголовок, ширина)
 PROCESS_COLUMNS: Tuple[Tuple[str, str, int], ...] = (
+    ("num", "#", 40),
     ("pid", "PID", 60),
     ("name", "Имя процесса", 220),
     ("user", "Пользователь", 120),
@@ -55,6 +56,7 @@ PROCESS_COLUMNS: Tuple[Tuple[str, str, int], ...] = (
 )
 
 _PROCESS_SORT_KEYS = {
+    "num": lambda p: 0,
     "pid": lambda p: p.pid,
     "name": lambda p: p.name.lower(),
     "user": lambda p: p.username.lower(),
@@ -81,6 +83,17 @@ _NAV_ITEMS: Tuple[Tuple[str, str, str], ...] = (
     ("battery", "Батарея", "battery"),
     ("processes", "Диспетчер задач", "tasks"),
 )
+# Варианты полей фильтрации
+_FILTER_FIELDS: List[Tuple[str, str]] = [
+    ("all", "Везде"),
+    ("name", "Имя процесса"),
+    ("pid", "PID"),
+    ("user", "Пользователь"),
+    ("status", "Состояние"),
+]
+
+
+
 
 
 class CoreBar(ctk.CTkFrame):
@@ -133,6 +146,8 @@ class SystemInfoApp(ctk.CTk):
         self._live_updates_var = tk.BooleanVar(value=True)
         self._worker_started = False
         self._is_first_run = True
+        self._force_refresh_event = threading.Event()
+        self._process_tab_last_hash = -1
 
         # История значений для спарклайнов (общая загрузка ЦП и памяти).
         self._cpu_history: "collections.deque[float]" = collections.deque(maxlen=HISTORY_LENGTH)
@@ -150,9 +165,11 @@ class SystemInfoApp(ctk.CTk):
 
         # Состояние диспетчера задач
         self._process_filter_var = tk.StringVar()
+        self._process_filter_field = tk.StringVar(value="all")
         self._process_sort_column = "cpu"
         self._process_sort_reverse = True
         self._process_row_data: Dict[str, ProcessInfo] = {}
+        self._filter_debounce_timer: Optional[str] = None
 
         self._ttk_style = ttk.Style(self)
         try:
@@ -456,12 +473,24 @@ class SystemInfoApp(ctk.CTk):
         inner = ctk.CTkFrame(toolbar, fg_color="transparent")
         inner.pack(fill="x", padx=14, pady=10)
 
+        # --- Выбор поля для фильтрации ---
+        field_menu = ctk.CTkOptionMenu(
+            inner,
+            values=[label for _key, label in _FILTER_FIELDS],
+            command=self._on_filter_field_change,
+            width=150, height=32, corner_radius=theme.RADIUS_SM,
+            fg_color=theme.color("card_bg"), button_color=theme.color("accent"),
+            text_color=theme.color("text_primary"), font=theme.font("small"),
+        )
+        field_menu.pack(side="left", padx=(0, 8))
+        self._filter_field_menu = field_menu
+
         search_entry = ctk.CTkEntry(
-            inner, textvariable=self._process_filter_var, placeholder_text="Поиск по имени или PID...",
-            width=240, height=32, corner_radius=theme.RADIUS_SM,
+            inner, textvariable=self._process_filter_var, placeholder_text="Поиск...",
+            width=220, height=32, corner_radius=theme.RADIUS_SM,
         )
         search_entry.pack(side="left")
-        self._process_filter_var.trace_add("write", lambda *_a: self._refresh_process_view())
+        self._process_filter_var.trace_add("write", lambda *_a: self._schedule_filter_debounce())
 
         ctk.CTkButton(
             inner, text="Завершить процесс", command=self._terminate_selected_process, height=32,
@@ -494,7 +523,7 @@ class SystemInfoApp(ctk.CTk):
         tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
         for key, label, width in PROCESS_COLUMNS:
             tree.heading(key, text=label, command=lambda c=key: self._sort_process_view(c))
-            anchor = tk.W if key in ("name", "user", "status") else tk.E
+            anchor = tk.CENTER if key == "num" else (tk.W if key in ("name", "user", "status") else tk.E)
             tree.column(key, width=width, anchor=anchor)
         tree.tag_configure("high", foreground=theme.resolve("danger"))
         tree.tag_configure("warn", foreground=theme.resolve("warning"))
@@ -545,9 +574,9 @@ class SystemInfoApp(ctk.CTk):
             threading.Thread(target=self._collect_in_background, daemon=True).start()
 
     def _refresh_data(self) -> None:
-        if self._is_first_run:
-            self._status_label.configure(text="Сбор информации о системе...")
+        self._status_label.configure(text="Обновление...")
         self._ensure_worker_running()
+        self._force_refresh_event.set()
 
     def _collect_in_background(self) -> None:
         import platform
@@ -564,16 +593,26 @@ class SystemInfoApp(ctk.CTk):
                 logger.debug("Не удалось инициализировать pythoncom: %s", exc)
 
         try:
+            process_tick = 0
             while True:
                 try:
-                    want_processes = self._is_first_run or self._is_process_page_active()
+                    force = self._force_refresh_event.is_set()
+                    if force:
+                        self._force_refresh_event.clear()
+
+                    want_processes = (self._is_first_run or force or
+                                      (self._is_process_page_active() and process_tick % 3 == 0))
                     snapshot = self._collector.collect_all(
                         is_first_run=self._is_first_run, collect_processes=want_processes
                     )
                     self._result_queue.put(snapshot)
                     if self._is_first_run:
                         self._is_first_run = False
-                    time.sleep(1.0)
+                    process_tick += 1
+                    if force:
+                        time.sleep(0.15)
+                    else:
+                        time.sleep(1.0)
                 except Exception:
                     logger.exception("Ошибка при сборе данных")
                     time.sleep(1.0)
@@ -893,22 +932,32 @@ class SystemInfoApp(ctk.CTk):
     def _populate_process_tab(self, s: SystemSnapshot) -> None:
         processes = list(s.processes)
         query = self._process_filter_var.get().strip().lower()
+        field = self._process_filter_field.get()
         if query:
-            processes = [p for p in processes if query in p.name.lower() or query == str(p.pid)]
+            processes = [p for p in processes if self._process_matches_filter(p, query, field)]
+
+        # Хеш-проверка: не перерисовываем таблицу, если данные не изменились.
+        # Это критически важно для плавности скролла — ttk.Treeview начинает
+        # сильно тормозить, если обновлять все его строки каждую секунду.
+        new_hash = hash((tuple(sorted(p.pid for p in processes)),
+                          self._process_sort_column, self._process_sort_reverse))
+        if new_hash == self._process_tab_last_hash:
+            return
+        self._process_tab_last_hash = new_hash
 
         key_func = _PROCESS_SORT_KEYS.get(self._process_sort_column, _PROCESS_SORT_KEYS["cpu"])
         processes.sort(key=key_func, reverse=self._process_sort_reverse)
         self._process_row_data = {str(p.pid): p for p in processes}
 
         tree = self._process_tree
-        current_map = {tree.item(iid, "values")[0]: iid for iid in tree.get_children()}
-        for p in processes:
+        current_map = {str(tree.item(iid, "values")[1]): iid for iid in tree.get_children()}
+        for num, p in enumerate(processes, start=1):
             tag = "high" if p.cpu_percent >= 85 else "warn" if p.cpu_percent >= 60 else ""
             row = (
-                str(p.pid), p.name, p.username, p.status, p.cpu_percent, p.memory_mb, p.memory_percent,
+                str(num), str(p.pid), p.name, p.username, p.status, p.cpu_percent, p.memory_mb, p.memory_percent,
                 p.disk_read_kb_s, p.disk_write_kb_s, p.network_connections, p.num_threads,
             )
-            key = row[0]
+            key = str(p.pid)
             if key in current_map:
                 iid = current_map.pop(key)
                 tree.item(iid, values=row, tags=(tag,) if tag else ())
@@ -922,6 +971,36 @@ class SystemInfoApp(ctk.CTk):
     def _refresh_process_view(self) -> None:
         if self._latest_snapshot is not None:
             self._populate_process_tab(self._latest_snapshot)
+
+    def _on_filter_field_change(self, selected_label: str) -> None:
+        for key, label in _FILTER_FIELDS:
+            if label == selected_label:
+                self._process_filter_field.set(key)
+                break
+        if self._latest_snapshot is not None:
+            self._populate_process_tab(self._latest_snapshot)
+
+    def _process_matches_filter(self, p: ProcessInfo, query: str, field: str) -> bool:
+        if not query:
+            return True
+        if field == "all":
+            return (query in p.name.lower() or query == str(p.pid) or
+                    query in p.username.lower() or query in p.status.lower())
+        if field == "name":
+            return query in p.name.lower()
+        if field == "pid":
+            return query == str(p.pid)
+        if field == "user":
+            return query in p.username.lower()
+        if field == "status":
+            return query in p.status.lower()
+        return True
+
+    def _schedule_filter_debounce(self) -> None:
+        if hasattr(self, '_filter_debounce_timer') and self._filter_debounce_timer is not None:
+            self.after_cancel(self._filter_debounce_timer)
+        self._filter_debounce_timer = self.after(300, self._refresh_process_view)
+
 
     def _sort_process_view(self, column: str) -> None:
         if self._process_sort_column == column:
@@ -939,7 +1018,7 @@ class SystemInfoApp(ctk.CTk):
         if not values:
             return None
         try:
-            return int(values[0])
+            return int(values[1])  # PID now at index 1 (after #)
         except (ValueError, IndexError):
             return None
 

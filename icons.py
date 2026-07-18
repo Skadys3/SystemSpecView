@@ -3,29 +3,30 @@ icons.py
 
 Программная генерация плоских линейных иконок для боковой панели навигации.
 
-Иконки рисуются через Pillow (``ImageDraw``) с 4-кратным супersampling'ом
-и затем уменьшаются с фильтром LANCZOS — это даёт гладкие сглаженные линии
-без единого файла изображения в проекте и без зависимости от того, какие
-именно эмодзи-шрифты установлены на компьютере пользователя.
+Иконки генерируются через PIL/Pillow если он установлен, иначе возвращают None
+(интерфейс работает без иконок, только с текстом).
 
-Каждая иконка существует в двух вариантах:
-
-* обычный (``light``/``dark``) — приглушённый нейтральный цвет, авто-
-  переключаемый ``CTkImage`` в зависимости от текущей темы оформления;
-* акцентный — один и тот же яркий цвет акцента в обеих темах, используется
-  для подсветки выбранного пункта навигации.
+Исправление для Python 3.15+: Pillow не имеет совместимых бинарных сборок,
+поэтому импорт PIL сделан опциональным.
 """
 
-from typing import Callable, Dict, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
-from PIL import Image, ImageDraw
 import customtkinter as ctk
 
-_SUPERSAMPLE = 4
+try:
+    from PIL import Image, ImageDraw
+
+    _PIL_AVAILABLE = True
+except Exception:
+    _PIL_AVAILABLE = False
 
 # Приглушённые нейтральные цвета обводки иконок под каждую тему.
 _STROKE_LIGHT = "#4B5568"
 _STROKE_DARK = "#AAB4CC"
+
+_SUPERSAMPLE = 4
+_cache: Dict[Tuple[str, int, str], Optional["ctk.CTkImage"]] = {}
 
 
 def _canvas(size: int) -> Tuple[Image.Image, ImageDraw.ImageDraw, int]:
@@ -43,8 +44,7 @@ def _stroke_width(hi: int) -> int:
 
 
 # ------------------------------------------------------------------ #
-# Функции отрисовки отдельных иконок. Каждая принимает ImageDraw,
-# сторону канвы в пикселях (после супersampling'а) и цвет обводки.
+# Функции отрисовки отдельных иконок (требуют PIL)
 # ------------------------------------------------------------------ #
 def _draw_dashboard(d: ImageDraw.ImageDraw, hi: int, c: str) -> None:
     w = _stroke_width(hi)
@@ -72,9 +72,7 @@ def _draw_cpu(d: ImageDraw.ImageDraw, hi: int, c: str) -> None:
     d.rounded_rectangle([pad, pad, hi - pad, hi - pad], radius=hi * 0.06, outline=c, width=w)
     inner = hi * 0.10
     d.rectangle([pad + inner, pad + inner, hi - pad - inner, hi - pad - inner], outline=c, width=max(2, w - 1))
-    # "ножки" по краям
     positions = [0.30, 0.50, 0.70]
-    leg = hi * 0.10
     for p in positions:
         y = hi * p
         d.line([0, y, pad, y], fill=c, width=w)
@@ -110,7 +108,6 @@ def _draw_network(d: ImageDraw.ImageDraw, hi: int, c: str) -> None:
     r_node = hi * 0.075
     dist = hi * 0.32
     import math
-
     d.ellipse([cx - r_center, cy - r_center, cx + r_center, cy + r_center], outline=c, width=w)
     for angle in (90, 210, 330):
         rad = math.radians(angle)
@@ -128,7 +125,6 @@ def _draw_gpu(d: ImageDraw.ImageDraw, hi: int, c: str) -> None:
     cx, cy, r = (x0 + x1) / 2, (y0 + y1) / 2, (y1 - y0) * 0.30
     d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=c, width=w)
     import math
-
     for angle in range(0, 360, 60):
         rad = math.radians(angle)
         sx, sy = cx + r * 0.35 * math.cos(rad), cy + r * 0.35 * math.sin(rad)
@@ -182,12 +178,11 @@ _DRAWERS: Dict[str, Callable[[ImageDraw.ImageDraw, int, str], None]] = {
     "tasks": _draw_tasks,
 }
 
-_cache: Dict[Tuple[str, int, str], "ctk.CTkImage"] = {}
 
-
-def get_icon(name: str, size: int = 20) -> "ctk.CTkImage":
-    """Возвращает нейтральную иконку, автоматически подстраивающуюся под
-    текущую тему оформления (светлая/тёмная)."""
+def get_icon(name: str, size: int = 20) -> Optional["ctk.CTkImage"]:
+    """Возвращает нейтральную иконку или None, если PIL недоступен."""
+    if not _PIL_AVAILABLE:
+        return None
     key = (name, size, "neutral")
     if key not in _cache:
         drawer = _DRAWERS[name]
@@ -201,9 +196,10 @@ def get_icon(name: str, size: int = 20) -> "ctk.CTkImage":
     return _cache[key]
 
 
-def get_icon_accent(name: str, color: str, size: int = 20) -> "ctk.CTkImage":
-    """Возвращает иконку в цвете акцента (для выбранного пункта навигации),
-    одинаковую в обеих темах."""
+def get_icon_accent(name: str, color: str, size: int = 20) -> Optional["ctk.CTkImage"]:
+    """Возвращает иконку в цвете акцента или None, если PIL недоступен."""
+    if not _PIL_AVAILABLE:
+        return None
     key = (name, size, color)
     if key not in _cache:
         drawer = _DRAWERS[name]
