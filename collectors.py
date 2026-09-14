@@ -48,12 +48,15 @@ if pynvml is not None:
 
 import datetime
 import logging
+from pathlib import Path
 import platform
 import socket
 import time
 from typing import Dict, List, Optional, Tuple
 
 import psutil
+
+from platform_collectors import create_platform_collector
 
 from models import (
     BatteryInfo,
@@ -142,6 +145,9 @@ class SystemInfoCollector:
     """Собирает информацию о системе, оборудовании и конфигурации по запросу."""
 
     def __init__(self) -> None:
+        # Platform-specific discovery is isolated from the public collector API.
+        self._platform_collector = create_platform_collector()
+
         # Убираем жесткую инициализацию клиента из конструктора главного потока
         pass
         
@@ -170,16 +176,33 @@ class SystemInfoCollector:
     # Отдельные сборщики данных
     # ------------------------------------------------------------------ #
     def get_os_info(self) -> OSInfo:
-        """Собирает идентификационные данные ОС, время загрузки и время работы."""
+        """Собирает идентификационные данные ОС, включая Linux distribution."""
         try:
             boot_timestamp = psutil.boot_time()
             boot_dt = datetime.datetime.fromtimestamp(boot_timestamp)
             uptime_delta = datetime.datetime.now() - boot_dt
+            system = platform.system()
+            release = platform.release()
+            version = platform.version()
+
+            # Linux exposes a human-readable distribution name in os-release.
+            if system == "Linux":
+                try:
+                    os_release = {}
+                    for line in Path("/etc/os-release").read_text(encoding="utf-8", errors="replace").splitlines():
+                        if "=" in line and not line.startswith("#"):
+                            key, value = line.split("=", 1)
+                            os_release[key] = value.strip().strip('"')
+                    release = os_release.get("PRETTY_NAME", release)
+                    version = os_release.get("VERSION", version)
+                except OSError:
+                    pass
+
             return OSInfo(
-                system=platform.system(),
+                system=system,
                 node_name=platform.node(),
-                release=platform.release(),
-                version=platform.version(),
+                release=release,
+                version=version,
                 machine=platform.machine(),
                 architecture=platform.architecture()[0],
                 processor=platform.processor() or "Н/Д",
@@ -193,23 +216,23 @@ class SystemInfoCollector:
     def get_cpu_info(self, is_first_run: bool = False) -> CPUInfo:
         """Собирает данные о CPU под структуру датакласса CPUInfo без просадок в 0%."""
         import psutil
-        
-        # На самом первом запуске принудительно делаем микрозамер (0.1 сек), чтобы убрать стартовый 0.0.
-        # В последующие секунды ставим None: так как поток теперь бесконечный и работает через time.sleep(1.0),
-        # psutil идеально считает разницу по системным тикам со времени прошлого вызова.
+
+        # На самом первом запуске принудительно делаем микрозамер (0.1 сек),
+        # чтобы убрать стартовый 0.0.
+        # В последующие секунды ставим None.
         interval = 0.1 if is_first_run else None
-        
+
         total_pct = psutil.cpu_percent(interval=interval)
         cores_pct = psutil.cpu_percent(interval=interval, percpu=True)
-        
-        # Подстраховка: если из-за таймингов операционной системы None вернул чистый ноль на всех ядрах,
-        # используем последнее известное рабочее значение (если оно сохранилось в кэше)
+
+        # Подстраховка от нулевого значения.
         if not is_first_run and total_pct == 0.0 and sum(cores_pct) == 0.0:
-            if hasattr(self, "_last_valid_total") and hasattr(self, "_last_valid_cores"):
+            if hasattr(self, "_last_valid_total") and hasattr(
+                self, "_last_valid_cores"
+            ):
                 total_pct = self._last_valid_total
                 cores_pct = self._last_valid_cores
         else:
-            # Сохраняем удачные ненулевые замеры в кэш
             self._last_valid_total = total_pct
             self._last_valid_cores = cores_pct
 
@@ -218,23 +241,65 @@ class SystemInfoCollector:
         current_f = freq.current if freq else 0.0
         min_f = freq.min if freq else 0.0
         max_f = freq.max if freq else 0.0
-        
+
         # Кэш имени процессора
         if not hasattr(self, "_cached_cpu_name"):
             self._cached_cpu_name = "Н/Д"
+
+        # Windows: WMI
+        if platform.system() == "Windows":
             wmi_client = self._get_wmi_client()
+
             if wmi_client:
                 try:
                     for cpu in wmi_client.Win32_Processor():
-                        if getattr(cpu, "Name", None):
-                            self._cached_cpu_name = cpu.Name.strip()
-                            break
-                except Exception:
-                    pass
-            if self._cached_cpu_name == "Н/Д":
-                import platform
-                self._cached_cpu_name = platform.processor() or "Unknown Processor"
+                        name = getattr(cpu, "Name", None)
 
+                        if name:
+                            self._cached_cpu_name = name.strip()
+                            break
+
+                except Exception as exc:
+                    logger.debug(
+                        "Не удалось получить имя CPU через WMI: %s",
+                        exc,
+                    )
+
+        # Linux: /proc/cpuinfo
+        elif platform.system() == "Linux":
+            try:
+                cpuinfo = Path("/proc/cpuinfo")
+
+                if cpuinfo.exists():
+                    for line in cpuinfo.read_text(
+                        encoding="utf-8",
+                        errors="replace",
+                    ).splitlines():
+
+                        if line.lower().startswith("model name"):
+                            _, value = line.split(":", 1)
+                            value = value.strip()
+
+                            if value:
+                                self._cached_cpu_name = value
+                                break
+
+            except OSError as exc:
+                logger.debug(
+                    "Не удалось прочитать /proc/cpuinfo: %s",
+                    exc,
+                )
+
+        # Универсальный fallback
+        if self._cached_cpu_name == "Н/Д":
+            fallback_name = platform.processor().strip()
+
+            if fallback_name:
+                self._cached_cpu_name = fallback_name
+            else:
+                self._cached_cpu_name = "Unknown Processor"
+
+        # ВАЖНО: return находится вне fallback-блока
         return CPUInfo(
             name=self._cached_cpu_name,
             physical_cores=psutil.cpu_count(logical=False) or 0,
@@ -243,7 +308,7 @@ class SystemInfoCollector:
             min_frequency_mhz=min_f,
             current_frequency_mhz=current_f,
             total_usage_percent=total_pct,
-            per_core_usage_percent=cores_pct
+            per_core_usage_percent=cores_pct,
         )
 
     def get_memory_info(self) -> MemoryInfo:
@@ -326,7 +391,12 @@ class SystemInfoCollector:
         return interfaces
 
     def get_gpu_info(self, is_first_run: bool = False) -> List[GPUInfo]:
-        """Собирает сведения о видеокарте (WMI только при первом запуске, NVML — всегда)."""
+        """Собирает сведения о видеокарте через платформенный provider."""
+        if platform.system() == "Linux":
+            provided = self._platform_collector.get_gpu_info()
+            if provided is not None:
+                return provided
+
         gpus: List[GPUInfo] = []
         wmi_client = self._get_wmi_client()
         
@@ -398,7 +468,12 @@ class SystemInfoCollector:
         return gpus
 
     def get_motherboard_info(self) -> MotherboardInfo:
-        """Собирает сведения о материнской плате и прошивке BIOS/UEFI через WMI."""
+        """Собирает сведения о материнской плате через платформенный provider."""
+        if platform.system() == "Linux":
+            provided = self._platform_collector.get_motherboard_info()
+            if provided is not None:
+                return provided
+
         wmi_client = self._get_wmi_client()
         if wmi_client:
             try:
@@ -781,11 +856,9 @@ class SystemInfoCollector:
         # результат (None) навсегда оставался "ложным", и WMI-запрос
         # повторялся заново на каждом цикле опроса. Явный флаг это исключает.
         if not hasattr(self, "_motherboard_collected"):
-            self._cached_motherboard_info = (
-                self.get_motherboard_info() if self._get_wmi_client() else MotherboardInfo()
-            )
+            self._cached_motherboard_info = self.get_motherboard_info()
             self._motherboard_collected = True
-
+            
         if collect_processes:
             self._last_process_list = self.get_process_list()
         elif not hasattr(self, "_last_process_list"):

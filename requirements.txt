@@ -21,3 +21,7 @@ pywin32>=306; platform_system == "Windows"
 # NVIDIA GPUs only; on other GPUs the app simply won't get "live" VRAM
 # usage data.
 pynvml>=11.5.0; platform_system == "Windows"
+
+# Linux hardware discovery uses sysfs/DMI directly. Optional command-line tools:
+# - pciutils (lspci) for GPU enumeration
+# - NVIDIA driver package (nvidia-smi) for NVIDIA VRAM/driver telemetry
