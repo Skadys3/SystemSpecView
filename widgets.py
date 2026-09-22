@@ -178,7 +178,7 @@ class RingGauge(_ThemedCanvas):
 # ------------------------------------------------------------------ #
 class Card(ctk.CTkFrame):
     def __init__(self, master, **kwargs):
-        kwargs.setdefault("corner_radius", theme.RADIUS)
+        kwargs.setdefault("corner_radius", 0)
         kwargs.setdefault("fg_color", theme.color("card_bg"))
         kwargs.setdefault("border_width", 1)
         kwargs.setdefault("border_color", theme.color("card_border"))
