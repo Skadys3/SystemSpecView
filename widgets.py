@@ -293,7 +293,7 @@ class ProgressStatCard(Card):
         self._last_pct = -999.0
         self._last_sub = ""
 
-    def update(self, value_text: str, percent: float, subtitle: str = "", muted: bool = False) -> None:
+    def update(self, value_text: str, percent: float, subtitle: str = "", muted: bool = False, color_key: Optional[str] = None) -> None:
         pct_rounded = round(percent, 1)
         if value_text == self._last_vt and pct_rounded == self._last_pct and subtitle == self._last_sub:
             return
@@ -304,7 +304,10 @@ class ProgressStatCard(Card):
         self._value_label.configure(text=value_text)
         self._percent_label.configure(text="" if muted else f"{percent:.0f}%")
         self._bar.set(0.0 if muted else max(0.0, min(1.0, percent / 100.0)))
-        self._bar.configure(progress_color=theme.color("track" if muted else theme.level_color(percent)))
+
+        progress_color = "track" if muted else (color_key or theme.level_color(percent))
+        self._bar.configure(progress_color=theme.color(progress_color))
+
         self._sub_label.configure(text=subtitle)
 
 

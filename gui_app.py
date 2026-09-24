@@ -802,7 +802,10 @@ class SystemInfoApp(ctk.CTk):
         b = s.battery
         if b.present:
             self._dash_battery_card.update(
-                f"{b.percent:.0f}%", b.percent, "Питание от сети" if b.plugged_in else f"Осталось: {b.time_left}"
+                f"{b.percent:.0f}%",
+                b.percent,
+                "Питание от сети" if b.plugged_in else f"Осталось: {b.time_left}",
+                color_key=theme.battery_level_color(b.percent),
             )
         else:
             self._dash_battery_card.update("—", 0, "Настольный компьютер", muted=True)

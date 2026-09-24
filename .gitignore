@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+
+# Virtual environment
+.venv/
+venv/
+
+# Build artifacts
+dist/
+build/
+*.spec
+
+# Logs
+logs/
+
+# IDE
+.vscode/
+.idea/
+
+# Temp files
+fix_escape.py
+fix_gui_final.py
+
+# Local pictures
+.pictures/
+pictures/

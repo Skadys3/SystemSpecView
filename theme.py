@@ -110,3 +110,12 @@ def level_color(percent: float) -> str:
     if percent >= 60:
         return "warning"
     return "success"
+
+
+def battery_level_color(percent: float) -> str:
+    """Возвращает цвет индикатора уровня заряда батареи."""
+    if percent <= 20:
+        return "danger"
+    if percent <= 50:
+        return "warning"
+    return "success"
