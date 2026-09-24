@@ -231,14 +231,7 @@ class HeroStatCard(Card):
         self._last_detail = ""
         self._last_sub = ""
 
-    def update(
-        self,
-        percent: float,
-        detail: str,
-        subtitle: str,
-        history: Sequence[float],
-        history_max: float = 100.0,
-    ) -> None:
+    def update(self, percent: float, detail: str, subtitle: str, history: Sequence[float], history_max: float = 100.0) -> None: # type: ignore[override]
         level_key = theme.level_color(percent)
         self._ring.update_value(percent, color_key=level_key)
         if detail != self._last_detail:
@@ -293,21 +286,18 @@ class ProgressStatCard(Card):
         self._last_pct = -999.0
         self._last_sub = ""
 
-    def update(self, value_text: str, percent: float, subtitle: str = "", muted: bool = False, color_key: Optional[str] = None) -> None:
+    def update(self, value_text: str, percent: float, subtitle: str = "", muted: bool = False, color_key: Optional[str] = None) -> None: # type: ignore[override]
         pct_rounded = round(percent, 1)
         if value_text == self._last_vt and pct_rounded == self._last_pct and subtitle == self._last_sub:
             return
         self._last_vt = value_text
         self._last_pct = pct_rounded
         self._last_sub = subtitle
-
         self._value_label.configure(text=value_text)
         self._percent_label.configure(text="" if muted else f"{percent:.0f}%")
         self._bar.set(0.0 if muted else max(0.0, min(1.0, percent / 100.0)))
-
         progress_color = "track" if muted else (color_key or theme.level_color(percent))
         self._bar.configure(progress_color=theme.color(progress_color))
-
         self._sub_label.configure(text=subtitle)
 
 

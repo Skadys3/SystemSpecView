@@ -878,11 +878,16 @@ class SystemInfoApp(ctk.CTk):
             self._battery_widget.grid(row=0, column=0, sticky="ew")
             self._battery_widget_kind = b.present
 
-        if not b.present:
-            self._battery_widget.update("Не обнаружена", "Настольный компьютер без аккумулятора")
-        else:
-            status = "Питание от сети" if b.plugged_in else "Работает от батареи"
-            self._battery_widget.update(f"{b.percent:.0f}%", b.percent, f"{status} • Осталось: {b.time_left}")
+            if not b.present:
+                self._battery_widget.update("Не обнаружена", "Настольный компьютер без аккумулятора")
+            else:
+                status = "Питание от сети" if b.plugged_in else "Работает от батареи"
+                self._battery_widget.update(
+                    f"{b.percent:.0f}%",
+                    b.percent,
+                    f"{status} • Осталось: {b.time_left}",
+                    color_key=theme.battery_level_color(b.percent),
+                )
 
     # ------------------------------------------------------------------ #
     # Общий помощник: синхронизация количества динамических карточек
